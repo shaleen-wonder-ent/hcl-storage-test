@@ -390,7 +390,182 @@ if the client stays in the ANF zone**. Cross-zone, the answer is the same
 not the storage. **Buying more ANF capacity does nothing to fix the
 cross-zone problem.** Only zone-alignment does.
 
-### 4.3 Bottom line
+### 4.3 HA architecture options (when "spread across zones" is required)
+
+The §4.2 recommendation to pin compute to the ANF volume's zone naturally
+raises the question: *if the workload needs zone-level HA, how do we get
+both performance and HA at the same time?* The short answer is that
+**HA on ANF cannot come from sharing one volume across zones** — the
+cross-zone penalty measured here is a property of inter-AZ RTT and is not
+tunable away. HA has to come from **replicating the data**. There are
+three patterns that work, summarised below.
+
+**Why active-active across zones with a single ANF volume is not an
+option.** ANF volumes are inherently zonal (a zone is chosen at create
+time via Availability Zone Volume Placement); there is no regional or
+zone-redundant ANF volume. The NFS protocol is happy across zones, but
+every 4 KiB op pays the ~500 µs inter-zone RTT, which is exactly the
+3× drop we measured. So multi-zone HA must replicate the data into a
+separate volume in each consuming zone, not stretch one volume across
+zones.
+
+#### Pattern A — Per-zone ANF volumes + application-level replication
+
+One ANF volume **per zone**, each mounted only by pods in its own zone.
+Replication happens at the application layer (PostgreSQL streaming
+replication, MySQL async replicas, MongoDB replica sets, Kafka ISR,
+etc.). Every pod gets the aligned-zone IOPS we measured (~14k read /
+~4.7k write at iodepth=64). If Z1 fails, promote a replica in Z2 or Z3.
+
+```mermaid
+flowchart LR
+  subgraph Z1["Zone 1 (primary)"]
+    P1[Primary DB pod]:::primary --- V1[(ANF vol Z1)]
+  end
+  subgraph Z2["Zone 2 (replica)"]
+    R2[Replica DB pod]:::replica --- V2[(ANF vol Z2)]
+  end
+  subgraph Z3["Zone 3 (replica)"]
+    R3[Replica DB pod]:::replica --- V3[(ANF vol Z3)]
+  end
+  P1 -. async/sync replication .-> R2
+  P1 -. async/sync replication .-> R3
+  classDef primary fill:#0a7,stroke:#063,color:#fff
+  classDef replica fill:#06c,stroke:#024,color:#fff
+```
+
+* **AKS knobs:** one node pool per zone; per-replica `nodeAffinity` on the
+  StatefulSet; one PVC per zone backed by its own ANF volume.
+* **RTO:** seconds–minutes (promotion time).
+* **RPO:** zero (synchronous) to seconds (async), depending on the engine
+  and replication mode.
+* **Use when:** the app supports its own replication and you genuinely
+  need active-active reads.
+
+#### Pattern B — ANF Cross-Zone Replication (CZR), active-passive
+
+Azure does block-level asynchronous replication from a source ANF volume
+in Z1 to a destination volume in Z2 (and/or to another region via CRR).
+The destination is read-only until you break the peering and promote it.
+
+```mermaid
+flowchart LR
+  subgraph Z1["Zone 1 (active)"]
+    W[App pods]:::active --- VS[(ANF source vol)]
+  end
+  subgraph Z2["Zone 2 (standby)"]
+    S[Cold/standby pods]:::standby -.-> VD[(ANF dest vol - read-only)]
+  end
+  VS ==>|CZR async, RPO minutes| VD
+  classDef active fill:#0a7,stroke:#063,color:#fff
+  classDef standby fill:#888,stroke:#444,color:#fff
+```
+
+* **RTO:** minutes (break peering, mount destination read-write, start
+  pods in Z2).
+* **RPO:** depends on the replication schedule; typically minutes.
+* **Use when:** the workload cannot do its own replication (legacy
+  NFS-attached app, file server, shared scratch space).
+* **Not for:** active-active reads or sub-second RPO.
+
+#### Pattern C — Get out of the self-managed-DB business
+
+If the workload behind the ANF volume is a Postgres/MySQL/MariaDB, the
+cleanest HA story is **not to run it on ANF at all**. Use Azure Database
+for PostgreSQL Flexible Server (or MySQL Flexible Server) with
+**zone-redundant HA** enabled. Azure handles the cross-zone synchronous
+replication for you, you get a single endpoint, and your AKS pods just
+point at it. Storage performance becomes the managed service's problem,
+not yours.
+
+* **RTO:** ~60–120 s (managed failover).
+* **RPO:** zero (synchronous standby).
+* **Use when:** the workload is a supported managed engine and you don't
+  need DB-level customisation.
+
+#### Decision matrix
+
+| Need | Pattern |
+|---|---|
+| Self-managed DB on AKS, max IOPS + HA | **A** |
+| Legacy NFS app, no app-level replication | **B** |
+| Just need Postgres/MySQL with HA | **C** |
+| Read-heavy, can tolerate stale reads | **A** with async replicas |
+| Strict RPO = 0 | **A** sync, or **C** |
+
+### 4.4 Cost implications of HA
+
+All three HA patterns add cost — there is no free HA. The numbers below
+use round multipliers and rough PAYG monthly prices for this lab's
+shape (2 TiB Premium ANF volume + one `Standard_D8s_v5` client). Use
+the [Azure Pricing Calculator](https://azure.microsoft.com/pricing/calculator/)
+for production quotes.
+
+**Baseline today** ≈ ~$800/mo storage (2 TiB Premium ANF) + ~$290/mo
+compute (D8s_v5 PAYG) ≈ **~$1,100/mo**.
+
+#### Pattern A — Per-zone ANF + app replication
+
+| Item | Delta vs baseline |
+|---|---|
+| Extra ANF capacity pools / volumes (one per replica zone) | **+1× to +2× storage** (total 2–3×) |
+| Extra VM / pod per replica zone | **+1× to +2× compute** |
+| Inter-zone replication traffic (e.g. DB WAL) | Variable. Inter-AZ bandwidth in most US regions is now free or near-free; cross-region traffic is not — verify per region |
+| Pool minimums | Premium ANF pools have a 1 TiB minimum each, so small volumes per extra zone may over-provision |
+
+Ballpark for the 2 TiB workload: **~$1,900/mo** with one replica zone,
+**~$2,800/mo** with two replica zones.
+
+#### Pattern B — ANF Cross-Zone Replication
+
+| Item | Delta vs baseline |
+|---|---|
+| Destination ANF volume (same service level as source) | **+1× storage** |
+| CZR change-data transfer (per GB of changed blocks) | Modest — proportional to write rate |
+| Standby compute (cold or scaled-to-zero pods) | **~0** until failover |
+| Destination pool minimum | Subject to the same 1 TiB minimum |
+
+Ballpark: **~$1,900/mo** — same storage uplift as Pattern A with one
+replica zone, but compute stays near baseline because the standby is
+idle.
+
+#### Pattern C — Managed Flexible Server with ZR-HA
+
+| Item | Delta vs baseline |
+|---|---|
+| Managed service compute (primary + standby) | **~2× the equivalent self-managed VM** |
+| Managed storage (replicated, included in service) | Bundled — no separate ANF |
+| **Removed:** ANF volume cost | **−~$800/mo** |
+| **Removed:** AKS DB pod compute | **−~$290/mo** |
+| **Removed:** DBA / operations toil | Real but rarely budgeted |
+
+Ballpark for a comparable Postgres Flexible Server (Memory-Optimised
+E8ds_v5 + 2 TiB + ZR-HA): **~$1,500–2,000/mo all-in**. Often comes out
+**at or below** Pattern A once the baseline ANF + AKS-DB-pod costs
+disappear.
+
+#### Side-by-side
+
+| Configuration | Storage cost | Compute cost | HA model | Approx total/mo (2 TiB lab) |
+|---|---|---|---|---|
+| Today (1 zone, no HA) | 1× | 1× | None | ~$1,100 |
+| **A** Per-zone ANF + replication (1 replica zone) | 2× | 2× | Active-active reads, single writer | **~$1,900** |
+| **A** Per-zone ANF + replication (2 replica zones) | 3× | 3× | Full tri-zone | **~$2,800** |
+| **B** ANF CZR active-passive | 2× | ~1× | Standby + promote, RPO minutes | **~$1,900** |
+| **C** Managed Flex Server ZR-HA | bundled | n/a | Built-in sync replica | **~$1,500–2,000** |
+
+#### TL;DR for the cost conversation
+
+* **HA always adds ≥ 1× storage cost on ANF** — the replication target
+  has to live somewhere.
+* **Pattern A** is the most expensive *and* the highest-performing
+  across all zones. Pay for it when you genuinely need active-active reads.
+* **Pattern B** is the sweet spot if you only need failover, not
+  multi-zone reads — same storage uplift as A, but you save the compute.
+* **Pattern C** often wins on TCO once the DBA hours are counted —
+  prefer it whenever the workload is a supported managed engine.
+
+### 4.5 Bottom line
 
 > The original observation is correct. Azure NetApp Files Premium delivers
 > ~14k random 4 KiB read IOPS at 200 μs latency when the client VM is in
