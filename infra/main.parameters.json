@@ -1,0 +1,18 @@
+{
+    "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "location":          { "value": "westus3" },
+        "namePrefix":        { "value": "iopslab" },
+        "adminUsername":     { "value": "azureuser" },
+        "sshPublicKey":      { "value": "REPLACE_WITH_YOUR_SSH_PUBLIC_KEY" },
+        "sshSourceAddressPrefix": { "value": "0.0.0.0/0" },
+        "vmSize":            { "value": "Standard_D8s_v5" },
+        "alignedZone":       { "value": "1" },
+        "misalignedZone":    { "value": "2" },
+        "anfServiceLevel":   { "value": "Premium" },
+        "anfPoolSizeTiB":    { "value": 4 },
+        "anfVolumeSizeGiB":  { "value": 2048 },
+        "fileShareQuotaGiB": { "value": 100 }
+    }
+}

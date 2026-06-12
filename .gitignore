@@ -1,0 +1,26 @@
+# Deployment outputs - contains storage account keys, IPs
+infra/lab-output.json
+infra/.deploy.json
+
+# Bicep build artifacts
+infra/main.json
+**/*.bicepparam.json
+
+# SSH keys (should never be committed)
+*.pem
+*.pub
+id_rsa
+id_ed25519
+.ssh/
+
+# Test result outputs
+results-*.txt
+results-*.log
+*.fio
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
